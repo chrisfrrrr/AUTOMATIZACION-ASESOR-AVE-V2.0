@@ -1,15 +1,19 @@
 from __future__ import annotations
 import requests
 from urllib.parse import urljoin
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable
+import time
 
 class CanvasAPIError(Exception):
     pass
 
 class CanvasClient:
-    def __init__(self, base_url: str, token: str, timeout: int = 45):
+    def __init__(self, base_url: str, token: str, timeout: int = 120, max_retries: int = 3):
         self.base_url = base_url.rstrip('/') + '/'
-        self.timeout = timeout
+        # Canvas puede tardar bastante cuando se consultan entregas masivas.
+        # Usamos timeout separado: conexión corta y lectura amplia.
+        self.timeout = (10, timeout)
+        self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update({
             'Authorization': f'Bearer {token.strip()}',
@@ -27,12 +31,12 @@ class CanvasClient:
         params = dict(params or {})
         params.setdefault('per_page', 100)
         if not paginate:
-            r = self.session.get(url, params=params, timeout=self.timeout)
+            r = self._request_with_retry(url, params=params)
             return self._handle(r)
         results: List[Any] = []
         first = True
         while url:
-            r = self.session.get(url, params=params if first else None, timeout=self.timeout)
+            r = self._request_with_retry(url, params=params if first else None)
             data = self._handle(r)
             if isinstance(data, list):
                 results.extend(data)
@@ -41,6 +45,42 @@ class CanvasClient:
             url = r.links.get('next', {}).get('url')
             first = False
         return results
+
+
+    def _request_with_retry(self, url: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """Ejecuta GET con reintentos para evitar fallos temporales de Canvas.
+
+        Canvas puede responder lento en cursos grandes, especialmente al extraer
+        entregas. Un timeout aislado no debe romper todo el análisis si el
+        siguiente intento responde correctamente.
+        """
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return self.session.get(url, params=params, timeout=self.timeout)
+            except requests.exceptions.ReadTimeout as exc:
+                last_error = exc
+                time.sleep(min(2 * attempt, 6))
+            except requests.exceptions.ConnectionError as exc:
+                last_error = exc
+                time.sleep(min(2 * attempt, 6))
+        raise CanvasAPIError(
+            'Canvas tardó demasiado en responder. Intente nuevamente o seleccione una sección específica. '
+            f'Detalle técnico: {last_error}'
+        )
+
+    @staticmethod
+    def _chunks(values: Iterable[Any], size: int) -> Iterable[List[Any]]:
+        chunk = []
+        for value in values:
+            if value is None:
+                continue
+            chunk.append(value)
+            if len(chunk) >= size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
 
     @staticmethod
     def _handle(response: requests.Response) -> Any:
@@ -77,10 +117,32 @@ class CanvasClient:
             'order_by': 'due_at'
         })
 
-    def submissions(self, course_id: int | str) -> List[Dict[str, Any]]:
-        # Devuelve entregas de todos los estudiantes con la tarea incluida.
-        return self.get(f'courses/{course_id}/students/submissions', params={
+    def submissions(self, course_id: int | str, student_ids: Optional[List[int]] = None, chunk_size: int = 10) -> List[Dict[str, Any]]:
+        """Devuelve entregas de estudiantes.
+
+        En cursos grandes, pedir `student_ids[]=all` puede provocar ReadTimeout
+        en Streamlit Cloud. Por eso, cuando tenemos la lista de estudiantes de
+        la sección, consultamos en bloques pequeños. Esto hace más solicitudes,
+        pero cada una pesa menos y es mucho más estable.
+        """
+        endpoint = f'courses/{course_id}/students/submissions'
+
+        if student_ids:
+            all_results: List[Dict[str, Any]] = []
+            clean_ids = [int(x) for x in student_ids if str(x).isdigit()]
+            for chunk in self._chunks(clean_ids, chunk_size):
+                data = self.get(endpoint, params={
+                    'student_ids[]': chunk,
+                    'include[]': ['assignment'],
+                    'grouped': False
+                })
+                if isinstance(data, list):
+                    all_results.extend(data)
+            return all_results
+
+        # Fallback: solo si no hay lista de estudiantes disponible.
+        return self.get(endpoint, params={
             'student_ids[]': 'all',
-            'include[]': ['assignment', 'user'],
+            'include[]': ['assignment'],
             'grouped': False
         })

@@ -116,8 +116,11 @@ if generate:
         progress.progress(30, text='Extrayendo actividades publicadas...')
         assignments = client.assignments(course_id)
         assign_df = normalize_assignments(assignments)
-        progress.progress(50, text='Extrayendo entregas y estados...')
-        submissions = client.submissions(course_id)
+        progress.progress(50, text='Extrayendo entregas y estados por bloques...')
+        # Usamos los estudiantes ya encontrados para no pedir todas las entregas del curso
+        # en una sola solicitud. Esto evita timeouts en cursos o secciones grandes.
+        student_ids_for_submissions = sorted(valid_ids) if valid_ids else None
+        submissions = client.submissions(course_id, student_ids=student_ids_for_submissions, chunk_size=10)
         sub_df = normalize_submissions(submissions)
         if section_id and valid_ids and not sub_df.empty:
             sub_df = sub_df[sub_df['user_id'].isin(valid_ids)]
@@ -146,6 +149,7 @@ if generate:
         st.error(f'Canvas devolvió un error: {e}')
     except Exception as e:
         st.error(f'Ocurrió un error durante el análisis: {e}')
+        st.info('Sugerencia: si el curso tiene muchos estudiantes, seleccione una sección específica y vuelva a generar el análisis. La versión corregida consulta entregas por bloques para evitar saturar Canvas.')
 
 analysis = st.session_state.analysis
 if not analysis:
